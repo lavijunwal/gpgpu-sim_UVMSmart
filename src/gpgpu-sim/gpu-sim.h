@@ -319,6 +319,9 @@ public:
     unsigned get_max_concurrent_kernel() const { return max_concurrent_kernel; }
 
     void convert_byte_string();
+    //Lavi's Code
+    int pinning_criteria;
+
 private:
     void init_clock_domains(void ); 
 
@@ -612,6 +615,9 @@ public:
     unsigned long long num_dma;
     unsigned long long dma_page_transfer_read;
     unsigned long long dma_page_transfer_write;
+    //Lavi's Code
+    unsigned long long pinned_pages;
+    unsigned long long unpinned_pages;
 };
 
 // this class simulate the gmmu unit on chip
@@ -619,6 +625,9 @@ public:
 class gmmu_t {
 public:
    gmmu_t(class gpgpu_sim* gpu, const gpgpu_sim_config &config, class gpgpu_new_stats *new_stats);
+   //Lavi's Code:
+   ~gmmu_t();
+   //Lavi's Code:
    unsigned long long calculate_transfer_time(size_t data_size);
    void calculate_devicesync_time(size_t data_size);
    void cycle();
@@ -692,8 +701,18 @@ public:
    void traverse_and_reset_round_trip(struct lp_tree_node *root);
    void reset_bb_round_trip();
    void update_access_type(mem_addr_t addr, int type);
-
+   // Lavi's Code:
+   void get_spatial_locality_info(mem_addr_t addr);
+   int get_access_count(struct lp_tree_node *node);
+   int get_access_count_threshold();
+   // Lavi's Code:
    bool should_cause_page_migration(mem_addr_t addr, bool is_write);
+   // Lavi's Code:
+   std::map<mem_addr_t, std::vector<bool>> spatial_info;
+   std::set<mem_addr_t> pinned_set;
+   std::set<mem_addr_t> already_migrated_set;
+   std::set<mem_addr_t> migrating_set;
+   // Lavi's Code:
 private:
    // data structure to wrap memory fetch and page table walk delay
    struct page_table_walk_latency_t {
@@ -893,6 +912,8 @@ public:
     simt_core_cluster * getSIMTCluster(int index);
 
     gmmu_t * getGmmu();
+    class gmmu_t *m_gmmu;
+    
 private:
    // clocks
    void reinit_clock_domains(void);
@@ -910,7 +931,7 @@ private:
 
 ///// data /////
 
-   class gmmu_t *m_gmmu;
+   //class gmmu_t *m_gmmu;
    class simt_core_cluster **m_cluster;
    class memory_partition_unit **m_memory_partition_unit;
    class memory_sub_partition **m_memory_sub_partition;

@@ -237,7 +237,6 @@ void power_config::reg_options(class OptionParser * opp)
 	   option_parser_register(opp, "-steady_state_definition", OPT_CSTR,
 			   	  &gpu_steady_state_definition, "allowed deviation:number of samples",
 	                 	  "8:4");
-
 }
 
 void memory_config::reg_options(class OptionParser * opp)
@@ -485,6 +484,12 @@ void gpgpu_sim_config::reg_options(option_parser_t opp)
     m_shader_config.reg_options(opp);
     m_memory_config.reg_options(opp);
     power_config::reg_options(opp);
+
+    //Lavi's Code
+    option_parser_register(opp, "-pinning_criteria", OPT_INT32, &pinning_criteria,           
+                             "To decide pinning criteria",
+                             "0");
+
    option_parser_register(opp, "-gpgpu_max_cycle", OPT_INT32, &gpu_max_cycle_opt, 
                "terminates gpu simulation early (0 = no limit)",
                "0");
@@ -1633,6 +1638,8 @@ gpgpu_new_stats::gpgpu_new_stats(const gpgpu_sim_config &config)
     num_dma = 0;
     dma_page_transfer_read = 0;
     dma_page_transfer_write = 0;
+    pinned_pages = 0;
+    unpinned_pages = 0;
 
     tlb_thrashing = new std::map<mem_addr_t, std::vector<bool> >[m_config.num_cluster()];
 
@@ -1870,6 +1877,8 @@ void gpgpu_new_stats::print(FILE *fout) const
 
    fprintf(fout, "========================================Rdma statistics==============================\n");
    fprintf(fout, "dma_read: %llu\n", num_dma);
+   fprintf(fout, "number of pinned pages: %llu\n", pinned_pages);
+   fprintf(fout, "number of unpinned pages: %llu\n", unpinned_pages);
    fprintf(fout, "dma_migration_read %llu\n", dma_page_transfer_read);
    fprintf(fout, "dma_migration_write %llu\n", dma_page_transfer_write);
 
@@ -1934,6 +1943,26 @@ gpgpu_new_stats::~gpgpu_new_stats()
    delete[] ma_latency;
 }
 
+//Lavi's Code
+gmmu_t::~gmmu_t()
+{
+    std::map<mem_addr_t, std::vector<bool>> :: iterator it;
+    for(auto it : spatial_info)
+    {
+        int count = 0;
+        cout << it.first << " ";
+        std::vector<bool> v = it.second;
+        for(unsigned i = 0; i < v.size(); i++)
+        {
+            if(v[i] == 1)
+                count++;
+            cout << v[i] << " ";
+        }
+        cout << count << " ";
+        cout << endl;
+    }
+}
+//Lavi's Code
 
 gmmu_t::gmmu_t(class gpgpu_sim* gpu, const gpgpu_sim_config &config, class gpgpu_new_stats *new_stats)
 	:m_gpu(gpu),m_config(config), m_new_stats(new_stats)
@@ -2952,6 +2981,39 @@ void gmmu_t::inc_bb_access_counter(mem_addr_t addr)
 
    node->access_counter++;
 }
+//Lavi's Code
+void gmmu_t::get_spatial_locality_info(mem_addr_t addr)
+{
+    mem_addr_t temp = addr & ((1 << 12) - 1);
+    unsigned temp2 = temp >> 7;
+
+    mem_addr_t page_num = m_gpu->get_global_memory()->get_page_num(addr);
+    if(spatial_info.find(page_num) == spatial_info.end())
+        spatial_info[page_num] = vector<bool>(32, false);
+
+    spatial_info[page_num][temp2] = true;
+}
+
+int gmmu_t::get_access_count(struct lp_tree_node *node)
+{
+    if(node->size == MIN_PREFETCH_SIZE)
+        return node->access_counter & ((1 << 27) - 1);
+    return get_access_count(node->left) + get_access_count(node->right);
+}
+
+int gmmu_t::get_access_count_threshold()
+{
+    int number_of_nodes = 0;
+    int access_counter = 0;
+    for(std::list<struct lp_tree_node*>::iterator iter = large_page_info.begin(); iter != large_page_info.end(); iter++)
+    {
+        struct lp_tree_node *node = *iter;
+        number_of_nodes += (node->size / MIN_PREFETCH_SIZE);
+        access_counter += get_access_count(node);
+    }
+    return (access_counter / number_of_nodes);
+}
+//Lavi's Code
 
 void gmmu_t::inc_bb_round_trip(struct lp_tree_node *node)
 {
@@ -3105,6 +3167,100 @@ void gmmu_t::cycle()
         page_eviction_procedure();
     }
     
+    //Lavi's Code
+    //FOR UNPINNING
+    if((gpu_sim_cycle + gpu_tot_sim_cycle) % 100000 == 0)
+    {
+        //for spatial locality
+        if(m_config.pinning_criteria == 0)
+        {
+            std::set<mem_addr_t> :: iterator it = pinned_set.begin();
+            while(it != pinned_set.end())
+            {
+                std::set<mem_addr_t> :: iterator current = it++;
+                int page_count = 0;
+                mem_addr_t curr_page_num = m_gpu->get_global_memory()->get_page_num(*current);
+                for(mem_addr_t page_iter = curr_page_num; page_iter < curr_page_num + 16; page_iter++)
+                {
+                    if(spatial_info.find(page_iter) != spatial_info.end())
+                    {
+                        vector<bool> v = spatial_info[page_iter];
+                        int cacheline_count = 0;
+                        for(unsigned i = 0; i < v.size(); i++)
+                        {
+                            if(v[i] == 1)
+                                cacheline_count++;
+                        }
+                        if(cacheline_count >= 16)
+                            page_count++;
+                    }
+                }
+                if(page_count > 8)
+                {
+                    pinned_set.erase(current);
+                    cout << "Block with address " << *current << " unpinned." << endl;
+                    m_new_stats->unpinned_pages++;
+                }
+            }
+        }
+
+        //for access count
+        else if(m_config.pinning_criteria == 1)
+        {
+            std::set<mem_addr_t> :: iterator it = pinned_set.begin();
+            while(it != pinned_set.end())
+            {
+                std::set<mem_addr_t> :: iterator current = it++;
+                struct lp_tree_node *root = m_gpu->getGmmu()->get_lp_node(*current);
+                int access_count = get_bb_access_counter(root, *current);
+                if(access_count >= get_access_count_threshold())
+                {
+                    pinned_set.erase(current);
+                    cout << "Block with address " << *current << " unpinned." << endl;
+                    m_new_stats->unpinned_pages++;
+                }
+            }
+        }
+
+        //for both combined
+        else if(m_config.pinning_criteria == 2)
+        {
+            std::set<mem_addr_t> :: iterator it = pinned_set.begin();
+            while(it != pinned_set.end())
+            {
+                std::set<mem_addr_t> :: iterator current = it++;
+                struct lp_tree_node *root = m_gpu->getGmmu()->get_lp_node(*current);
+                int access_count = get_bb_access_counter(root, *current);
+
+                int page_count = 0;
+                mem_addr_t curr_page_num = m_gpu->get_global_memory()->get_page_num(*current);
+                for(mem_addr_t page_iter = curr_page_num; page_iter < curr_page_num + 16; page_iter++)
+                {
+                    if(spatial_info.find(page_iter) != spatial_info.end())
+                    {
+                        vector<bool> v = spatial_info[page_iter];
+                        int cacheline_count = 0;
+                        for(unsigned i = 0; i < v.size(); i++)
+                        {
+                            if(v[i] == 1)
+                                cacheline_count++;
+                        }
+                        if(cacheline_count >= 16)
+                            page_count++;
+                    }
+                }
+
+                if((access_count >= (0.5 * get_access_count_threshold())) && page_count > 8)
+                {
+                    pinned_set.erase(current);
+                    cout << "Block with address " << *current << " unpinned." << endl;
+                    m_new_stats->unpinned_pages++;
+                }
+            }
+        }
+    }
+    //Lavi's Code
+
     // check whether current transfer in the pcie write latency queue is finished
     if ( pcie_write_latency_queue != NULL && (gpu_sim_cycle+gpu_tot_sim_cycle) >= pcie_write_latency_queue->ready_cycle) {
                     
@@ -3195,6 +3351,21 @@ void gmmu_t::cycle()
 
                 // add to the valid pages list
                 refresh_valid_pages(m_gpu->get_global_memory()->get_mem_addr(*iter));
+                
+                //Lavi's Code
+                // code here for migration
+                //getting page address from page number
+                mem_addr_t p_addr = m_gpu->get_global_memory()->get_mem_addr(*iter);
+                //getting base address from page address
+                mem_addr_t b_addr = get_eviction_base_addr(p_addr);
+
+                //searching for this base address in the migrating set, and if found, moving it to already migrated set
+                if(migrating_set.find(b_addr) != migrating_set.end())
+                {
+                    migrating_set.erase(b_addr);
+                    already_migrated_set.insert(b_addr);
+                }
+                //Lavi's Code
 
                 m_new_stats->page_thrashing[*iter].push_back(true);
 
@@ -3335,6 +3506,23 @@ void gmmu_t::cycle()
             ((gpu_sim_cycle+gpu_tot_sim_cycle) >= page_table_walk_queue.front().ready_cycle )) {
 
         mem_fetch* mf = page_table_walk_queue.front().mf;
+        // Check for pinned pages and if so add delay DMA
+
+        //Lavi's Code
+        mem_addr_t curr_block_addr = mf->get_addr();
+
+        if(pinned_set.find(curr_block_addr) != pinned_set.end())
+        {
+            m_new_stats->num_dma++;
+            pcie_latency_t *p_t = new pcie_latency_t();
+            mf->set_dma();
+            p_t->mf = mf;
+            p_t->type = latency_type::DMA;
+            pcie_read_stage_queue.push_back(p_t);
+            page_table_walk_queue.pop_front();
+            continue;
+        }
+        //Lavi's Code
 
         list<mem_addr_t> page_list = m_gpu->get_global_memory()->get_faulty_pages(mf->get_addr(), mf->get_access_size());
 
@@ -3350,6 +3538,148 @@ void gmmu_t::cycle()
         } else {
             assert(page_list.size() == 1); 
      
+        //Lavi's Code
+        std::list<mem_addr_t> :: iterator it = page_list.begin();
+        //getting page address from page number
+        mem_addr_t p_addr = m_gpu->get_global_memory()->get_mem_addr(*it);
+        //getting block address from page address
+        mem_addr_t b_addr = get_eviction_base_addr(p_addr);
+
+        //if block not found in migrating_set
+        if(migrating_set.find(b_addr) == migrating_set.end())
+        {
+            //if block found in already_migrated_set
+            if(already_migrated_set.find(b_addr) != already_migrated_set.end())
+            {
+                //pinning check
+                //cout << "2. Current Cycle: " << gpu_sim_cycle + gpu_tot_sim_cycle << " and Address: " << b_addr << endl;
+                //for spatial locality
+                if(m_config.pinning_criteria == 0)
+                {
+                    int page_count = 0;
+                    //getting first page number from block address
+                    mem_addr_t first_page_num = m_gpu->get_global_memory()->get_page_num(b_addr);
+                    //iterating for all 16 pages of this block
+                    for(mem_addr_t page_iter = first_page_num; page_iter < (first_page_num + 16); page_iter++)
+                    {
+                        if(spatial_info.find(page_iter) != spatial_info.end())
+                        {
+                            vector<bool> v = spatial_info[page_iter];
+                            int cacheline_count = 0;
+                            for(unsigned i = 0; i < v.size(); i++)
+                            {
+                                if(v[i] == 1)
+                                    cacheline_count++;
+                            }
+                            if(cacheline_count >= 16)
+                                page_count++;
+                        }
+                    }
+
+                    if(page_count <= 8)
+                    {
+                        if(pinned_set.find(b_addr) == pinned_set.end())
+                        {
+                            m_new_stats->pinned_pages++;
+                            pinned_set.insert(b_addr);
+                            cout << "Block with address " << b_addr << " pinned." << endl;
+                        }
+                        m_new_stats->num_dma++;
+                        pcie_latency_t *p_t = new pcie_latency_t();
+                        mf->set_dma();
+                        p_t->mf = mf;
+                        p_t->type = latency_type::DMA;
+                        pcie_read_stage_queue.push_back(p_t);
+                        page_table_walk_queue.pop_front();
+                        continue;
+                    }
+                }
+
+                //for access count
+                else if(m_config.pinning_criteria == 1)
+                {
+                    struct lp_tree_node *root = m_gpu->getGmmu()->get_lp_node(b_addr);
+                    int access_count = get_bb_access_counter(root, b_addr);
+
+                    if(access_count < get_access_count_threshold())
+                    {
+                        if(pinned_set.find(b_addr) == pinned_set.end())
+                        {
+                            m_new_stats->pinned_pages++;
+                            pinned_set.insert(b_addr);
+                            cout << "Block with address " << b_addr << " pinned." << endl;
+                        }
+                        m_new_stats->num_dma++;
+                        pcie_latency_t *p_t = new pcie_latency_t();
+                        mf->set_dma();
+                        p_t->mf = mf;
+                        p_t->type = latency_type::DMA;
+                        pcie_read_stage_queue.push_back(p_t);
+                        page_table_walk_queue.pop_front();
+                        continue;
+                    }
+                }
+
+                //for both combined
+                else if(m_config.pinning_criteria == 2)
+                {
+                    //getting access count of the current basic block
+                    struct lp_tree_node *root = m_gpu->getGmmu()->get_lp_node(b_addr);
+                    int access_count = get_bb_access_counter(root, b_addr);
+                    int page_count = 0;
+                    //getting first page number from block address
+                    mem_addr_t first_page_num = m_gpu->get_global_memory()->get_page_num(b_addr);
+                    //iterating for all 16 pages of this block
+                    for(mem_addr_t page_iter = first_page_num; page_iter < (first_page_num + 16); page_iter++)
+                    {
+                        if(spatial_info.find(page_iter) != spatial_info.end())
+                        {
+                            vector<bool> v = spatial_info[page_iter];
+                            int cacheline_count = 0;
+                            for(unsigned i = 0; i < v.size(); i++)
+                            {
+                                if(v[i] == 1)
+                                    cacheline_count++;
+                            }
+                            if(cacheline_count >= 16)
+                                page_count++;
+                        }
+                    }
+
+                    int access_threshold = get_access_count_threshold();
+                    cout << "The access count threshold is " << access_threshold << endl;
+                    if(page_count <= 8 || access_count < (0.5 * access_threshold))
+                    {
+                        if(pinned_set.find(b_addr) == pinned_set.end())
+                        {
+                            m_new_stats->pinned_pages++;
+                            pinned_set.insert(b_addr);
+                            cout << "Block with address " << b_addr << " pinned." << endl;
+                        }
+                        m_new_stats->num_dma++;
+                        pcie_latency_t *p_t = new pcie_latency_t();
+                        mf->set_dma();
+                        p_t->mf = mf;
+                        p_t->type = latency_type::DMA;
+                        pcie_read_stage_queue.push_back(p_t);
+                        page_table_walk_queue.pop_front();
+                        continue;
+                    }
+                }
+            }
+
+            //if not found in already_migrated_set
+            else
+            {
+                //first fault, put it in migrating_set
+                //cout << "1. Current Cycle: " << gpu_sim_cycle + gpu_tot_sim_cycle << " and Address: " << b_addr << endl;
+                migrating_set.insert(b_addr);
+            }
+        }
+
+        //if block found in migrating_set, do nothing
+        //Lavi's Code
+
 	    m_new_stats->mf_page_miss[simt_cluster_id]++;	   
  
 	    // the page request is already there in MSHR either as a page fault or as part of scheduled prefetch request
@@ -3414,13 +3744,10 @@ void gmmu_t::cycle()
         if(!(m_gpu->getSIMTCluster(i))->empty_cu_gmmu_queue()) {
 
             mem_fetch* mf = (m_gpu->getSIMTCluster(i))->front_cu_gmmu_queue();
-
             struct page_table_walk_latency_t pt_t;
             pt_t.mf = mf;
             pt_t.ready_cycle = gpu_sim_cycle+gpu_tot_sim_cycle + m_config.page_table_walk_latency;
-
             page_table_walk_queue.push_back(pt_t);    
-
             (m_gpu->getSIMTCluster(i))->pop_cu_gmmu_queue();
         }
     }

@@ -96,7 +96,9 @@ bool break_limit = false;
 static void termination_callback()
 {
     g_the_gpu->m_new_stats->print(stdout);
-
+    //Lavi's Code
+    delete g_the_gpu -> m_gmmu;
+    //Lavi's Code
 /*
     FILE* f1 = fopen("Pcie_trace.txt", "w");
 
